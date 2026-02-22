@@ -39,6 +39,9 @@ PERMISSIONS = [
     "android.permission.WRITE_EXTERNAL_STORAGE",
     "android.permission.CAMERA",
     "android.permission.RECORD_AUDIO",
+    "android.permission.ACCESS_FINE_LOCATION",
+    "android.permission.ACCESS_COARSE_LOCATION",
+    "android.permission.ACCESS_BACKGROUND_LOCATION",
 ]
 
 
