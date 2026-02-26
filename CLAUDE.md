@@ -95,13 +95,28 @@ After tests complete and XML is parsed, upload results in 3 steps:
 - Parse XML test cases into the `test_results` array format (test_name, result, duration, error_message)
 - `device_info.model` comes from `adb shell getprop ro.product.model`
 
-### Scheduling Decision
+### Scheduling
 
 **Do NOT add scheduling to run.py.** Keep it a dumb single-shot CLI tool.
 
-Scheduling should be built into qa-reports (the web app) instead — it already has a `GET /api/schedules` endpoint. Add a UI there where Jyotsna/Troy can pick device + categories + time. Then a tiny daemon or cron on the test lab machine polls `/api/schedules` and kicks off `run.py` when it's time.
+Scheduling lives in qa-reports (the web app) — it has a `GET /api/schedules` endpoint and a `/schedules` UI where users pick device + categories + cron time.
 
-This keeps run.py simple and puts the scheduling UI where non-technical users can access it (the web app they already use).
+**Schedule Poller (`poll_schedules.py`)** runs on each test lab machine via Windows Task Scheduler (every 5 min):
+- Polls `GET /api/schedules`, evaluates cron expressions with `croniter`
+- If a schedule is due (within the 5-min poll window and not already run), kicks off `run.py`
+- Logs to `logs/poller_YYYY-MM-DD.log`
+- Requires `pip install croniter` (only external dep)
+- ADB model names use underscores (`SM_X610`), API uses hyphens (`SM-X610`) — poller handles both
+
+**Windows Task Scheduler setup:**
+```powershell
+# To remove:
+Unregister-ScheduledTask -TaskName "QA Test Schedule Poller" -Confirm:$false
+```
+
+**Windows paths** are auto-detected in run.py via `sys.platform == "win32"`:
+- Unity: `C:/Program Files/Unity/Hub/Editor/6000.3.2f1/Editor/Unity.exe`
+- Project: `C:/Users/shaff/Documents/GitHub/lingraphica-app`
 
 ### Reference: qa_testrunner (the big version)
 

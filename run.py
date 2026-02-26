@@ -20,8 +20,13 @@ from datetime import datetime
 from pathlib import Path
 
 # ── Config ──────────────────────────────────────────────────────────────────
-UNITY = "/Applications/Unity/Hub/Editor/6000.3.2f1/Unity.app/Contents/MacOS/Unity"
-PROJECT = "/Users/delliott/Documents/GitHub/lingraphica-app"
+if sys.platform == "win32":
+    UNITY = "C:/Program Files/Unity/Hub/Editor/6000.3.2f1/Editor/Unity.exe"
+    PROJECT = "C:/Users/shaff/Documents/GitHub/lingraphica-app"
+else:
+    UNITY = "/Applications/Unity/Hub/Editor/6000.3.2f1/Unity.app/Contents/MacOS/Unity"
+    PROJECT = "/Users/delliott/Documents/GitHub/lingraphica-app"
+
 PKG = "com.UnityTestRunner.UnityTestRunner"
 ACTIVITY = f"{PKG}/com.lingraphica.LGUnityPlayerActivity"
 DEVICE_RESULTS = "/sdcard/lingraphica/TestResults"
