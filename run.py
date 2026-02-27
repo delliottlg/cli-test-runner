@@ -32,7 +32,7 @@ ACTIVITY = f"{PKG}/com.lingraphica.LGUnityPlayerActivity"
 DEVICE_RESULTS = "/sdcard/lingraphica/TestResults"
 CATEGORIES_FILE = Path(__file__).parent / "categories.txt"
 POLL_INTERVAL = 10  # seconds
-POLL_TIMEOUT = 1800  # 30 minutes
+POLL_TIMEOUT = 5400  # 90 minutes
 
 APK_PATHS = [
     f"{PROJECT}/PlayerWithTests.apk",
@@ -97,7 +97,7 @@ def find_apk():
 # ── 6-Step Workflow ─────────────────────────────────────────────────────────
 def step_build(category):
     """Step 1: Build test APK via Unity batch mode."""
-    print(f"\n[1/6] Building APK for {category}...")
+    print(f"\n[1/7] Building APK for {category}...")
     apk_out = APK_PATHS[0]  # PlayerWithTests.apk
 
     # Remove old APK
@@ -138,30 +138,73 @@ def step_build(category):
     return None
 
 
+def step_cleanup_old_results(device):
+    """Step 2: Remove old test results from device to avoid stale detection."""
+    print(f"\n[2/7] Cleaning old results from device...")
+
+    # Check if there are any files to clean
+    rc, out = adb(["shell", "ls", f"{DEVICE_RESULTS}/"], device)
+    if rc != 0 or not out.strip():
+        print(f"  No old results to clean")
+        return
+
+    xml_files = [f for f in out.splitlines() if f.strip().endswith(".xml")]
+    if not xml_files:
+        print(f"  No XML files to clean")
+        return
+
+    print(f"  Found {len(xml_files)} old XML file(s), removing...")
+    for f in xml_files:
+        fname = f.strip()
+        path = f"{DEVICE_RESULTS}/{fname}"
+        # Try run-as first (required for enterprise/production devices)
+        rc, _ = adb(["shell", f"run-as {PKG} rm '{path}'"], device)
+        if rc != 0:
+            # Fallback to direct rm
+            rc, _ = adb(["shell", "rm", "-f", path], device)
+        if rc == 0:
+            print(f"  Removed: {fname}")
+        else:
+            print(f"  Could not remove: {fname} (will use pm clear)")
+
+    # Verify cleanup - if files remain, use nuclear option
+    rc, out = adb(["shell", "ls", f"{DEVICE_RESULTS}/"], device)
+    if rc == 0 and any(f.strip().endswith(".xml") for f in out.splitlines()):
+        print(f"  Files persist, using pm clear...")
+        adb(["shell", "pm", "clear", PKG], device)
+        print(f"  App data cleared")
+
+
 def step_uninstall(device):
-    """Step 2: Uninstall old APK."""
-    print(f"\n[2/6] Uninstalling old APK...")
+    """Step 3: Uninstall old APK."""
+    print(f"\n[3/7] Uninstalling old APK...")
     rc, out = adb(["uninstall", PKG], device)
     if rc == 0:
         print(f"  Uninstalled")
     else:
         print(f"  No previous install (ok)")
+    time.sleep(2)  # Brief pause after uninstall before install
 
 
 def step_install(device, apk_path):
-    """Step 3: Install APK on device."""
-    print(f"\n[3/6] Installing APK...")
+    """Step 4: Install APK on device."""
+    print(f"\n[4/7] Installing APK...")
     rc, out = adb(["install", apk_path], device, timeout=300)
     if rc != 0 or "Success" not in out:
-        print(f"  ERROR: Install failed: {out}")
-        return False
+        print(f"  Install attempt 1 failed: {out}")
+        print(f"  Retrying in 5s...")
+        time.sleep(5)
+        rc, out = adb(["install", apk_path], device, timeout=300)
+        if rc != 0 or "Success" not in out:
+            print(f"  ERROR: Install failed after retry: {out}")
+            return False
     print(f"  Installed successfully")
     return True
 
 
 def step_permissions(device):
-    """Step 4: Grant permissions (Android 16+ compatible)."""
-    print(f"\n[4/6] Granting permissions...")
+    """Step 5: Grant permissions (Android 16+ compatible)."""
+    print(f"\n[5/7] Granting permissions...")
 
     # MANAGE_EXTERNAL_STORAGE via appops (Android 16+ requirement)
     rc, _ = adb(["shell", "appops", "set", PKG, "MANAGE_EXTERNAL_STORAGE", "allow"], device)
@@ -177,10 +220,16 @@ def step_permissions(device):
         else:
             print(f"  {name}: failed ({out[:60]})")
 
+    # Force location to "all the time" via appops (prevents blocking dialog)
+    for loc_op in ["COARSE_LOCATION", "FINE_LOCATION"]:
+        rc, _ = adb(["shell", "appops", "set", PKG, loc_op, "allow"], device)
+        if rc == 0:
+            print(f"  {loc_op} appops: ok")
+
 
 def step_launch(device):
-    """Step 5: Launch test app."""
-    print(f"\n[5/6] Launching tests...")
+    """Step 6: Launch test app."""
+    print(f"\n[6/7] Launching tests...")
     rc, out = adb(
         ["shell", "am", "start", "-W", "-S", "--activity-clear-top", "-n", ACTIVITY],
         device,
@@ -193,8 +242,8 @@ def step_launch(device):
 
 
 def step_poll_and_pull(device, timeout=POLL_TIMEOUT):
-    """Step 6: Poll for results, pull XML when ready."""
-    print(f"\n[6/6] Waiting for test results...")
+    """Step 7: Poll for results, pull XML when ready."""
+    print(f"\n[7/7] Waiting for test results...")
     start = time.time()
 
     while time.time() - start < timeout:
@@ -377,7 +426,8 @@ def main():
                 continue
             print(f"\nUsing existing APK: {apk}")
 
-        # Steps 2-5: Deploy and launch
+        # Steps 2-6: Clean, deploy, and launch
+        step_cleanup_old_results(device)
         step_uninstall(device)
         if not step_install(device, apk):
             all_results[cat] = {"error": "Install failed"}
@@ -387,7 +437,7 @@ def main():
             all_results[cat] = {"error": "Launch failed"}
             continue
 
-        # Step 6: Poll and parse
+        # Step 7: Poll and parse
         xml_path = step_poll_and_pull(device, timeout=poll_timeout)
         if xml_path and xml_path.exists():
             all_results[cat] = parse_results(xml_path)

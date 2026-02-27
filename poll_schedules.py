@@ -23,12 +23,7 @@ SCHEDULES_URL = f"{API_BASE}/api/schedules"
 POLL_WINDOW_MINUTES = 5  # Must match Task Scheduler interval
 RUN_PY = Path(__file__).parent / "run.py"
 LOG_DIR = Path(__file__).parent / "logs"
-
-# Device serial lookup - maps device model to ADB serial.
-# The API returns model names (e.g. "SM-X610") but run.py needs serials.
-# Update this when devices change in the lab.
-DEVICE_SERIALS = {}
-# Populated at startup by querying adb devices
+LAST_RUN_FILE = Path(__file__).parent / "logs" / "last_runs.json"
 
 
 # ── Logging ─────────────────────────────────────────────────────────────────
@@ -94,30 +89,40 @@ def fetch_schedules(log):
         return []
 
 
-def update_last_run(schedule_id, log):
-    """PUT /api/schedules/<id> to update last_run_at."""
+def load_last_runs():
+    """Load local last_run_at tracking file."""
+    if LAST_RUN_FILE.exists():
+        try:
+            return json.loads(LAST_RUN_FILE.read_text())
+        except Exception:
+            return {}
+    return {}
+
+
+def save_last_run(schedule_id, log):
+    """Save last_run_at locally (API doesn't support updating it)."""
     try:
-        url = f"{API_BASE}/api/schedules/{schedule_id}"
-        payload = json.dumps({
-            "last_run_at": datetime.now(timezone.utc).isoformat()
-        }).encode()
-        req = urllib.request.Request(url, data=payload, method="PUT")
-        req.add_header("Content-Type", "application/json")
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            log.info(f"Updated last_run_at for schedule {schedule_id}: HTTP {resp.status}")
+        last_runs = load_last_runs()
+        last_runs[str(schedule_id)] = datetime.now().isoformat()
+        LAST_RUN_FILE.parent.mkdir(exist_ok=True)
+        LAST_RUN_FILE.write_text(json.dumps(last_runs, indent=2))
+        log.info(f"Saved last_run_at locally for schedule {schedule_id}")
     except Exception as e:
-        log.warning(f"Could not update last_run_at for schedule {schedule_id}: {e}")
+        log.warning(f"Could not save last_run_at for schedule {schedule_id}: {e}")
 
 
 # ── Cron Evaluation ─────────────────────────────────────────────────────────
-def is_schedule_due(schedule, now, log):
+def is_schedule_due(schedule, now, last_runs, log):
     """Check if a schedule should fire right now."""
     cron_expr = schedule.get("cron_expression")
     if not cron_expr:
         return False
 
     name = schedule.get("name", f"id={schedule.get('id')}")
-    last_run = schedule.get("last_run_at")
+    schedule_id = str(schedule.get("id", ""))
+
+    # Check both API last_run_at and local tracking
+    last_run = last_runs.get(schedule_id) or schedule.get("last_run_at")
 
     try:
         # Find the most recent time this cron should have fired
@@ -199,9 +204,9 @@ def run_schedule(schedule, device_serials, log):
         except Exception as e:
             log.error(f"  [{name}] Execution error: {e}")
 
-    # Update last_run_at after all devices done
+    # Track last_run_at locally
     if schedule_id:
-        update_last_run(schedule_id, log)
+        save_last_run(schedule_id, log)
 
 
 # ── Main ────────────────────────────────────────────────────────────────────
@@ -217,11 +222,13 @@ def main():
     else:
         log.warning("No devices connected via ADB")
 
-    # Fetch schedules
+    # Fetch schedules and local run history
     schedules = fetch_schedules(log)
     if not schedules:
         log.info("No schedules found, exiting")
         return
+
+    last_runs = load_last_runs()
 
     # Check each schedule
     due_count = 0
@@ -232,7 +239,7 @@ def main():
         name = sched.get("name", f"id={sched.get('id')}")
         log.info(f"Checking: {name} (cron: {sched.get('cron_expression')})")
 
-        if is_schedule_due(sched, now, log):
+        if is_schedule_due(sched, now, last_runs, log):
             due_count += 1
             run_schedule(sched, device_serials, log)
 
