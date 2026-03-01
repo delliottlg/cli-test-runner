@@ -10,11 +10,15 @@ Usage:
 """
 
 import argparse
+import json
 import os
 import shutil
+import socket
 import subprocess
 import sys
 import time
+import urllib.request
+import urllib.error
 import xml.etree.ElementTree as ET
 from datetime import datetime
 from pathlib import Path
@@ -33,6 +37,7 @@ DEVICE_RESULTS = "/sdcard/lingraphica/TestResults"
 CATEGORIES_FILE = Path(__file__).parent / "categories.txt"
 POLL_INTERVAL = 10  # seconds
 POLL_TIMEOUT = 5400  # 90 minutes
+QA_REPORTS_BASE = "https://qa-reports.vercel.app"
 
 APK_PATHS = [
     f"{PROJECT}/PlayerWithTests.apk",
@@ -267,19 +272,14 @@ def step_launch(device):
     # Step D: Verify app is actually in foreground
     time.sleep(3)
     for attempt in range(3):
-        rc, dumpsys = adb(["shell", "dumpsys", "activity", "activities"], device, timeout=15)
-        if rc == 0 and dumpsys:
-            for line in dumpsys.splitlines():
-                if "mResumedActivity" in line:
-                    if PKG in line:
-                        print(f"  App launched and in foreground")
-                        return True
-                    else:
-                        print(f"  WARNING: Other app in foreground: {line.strip()}")
-                    break
+        fg = _check_foreground(device)
+        if fg and PKG in fg:
+            print(f"  App launched and in foreground")
+            return True
+        elif fg:
+            print(f"  WARNING: Other app in foreground: {fg}")
 
         if attempt < 2:
-            # Retry: press Recent Apps then relaunch
             print(f"  Retrying launch (attempt {attempt + 2}/3)...")
             adb(["shell", "input", "keyevent", "KEYCODE_APP_SWITCH"], device)
             time.sleep(1)
@@ -293,20 +293,20 @@ def step_launch(device):
          "android.intent.category.LAUNCHER", "1"], device)
     time.sleep(2)
 
-    # Final foreground check
-    rc, dumpsys = adb(["shell", "dumpsys", "activity", "activities"], device, timeout=15)
-    if rc == 0 and dumpsys:
-        for line in dumpsys.splitlines():
-            if "mResumedActivity" in line:
-                if PKG in line:
-                    print(f"  App launched (via monkey)")
-                    return True
-                else:
-                    print(f"  WARNING: App may not be in foreground: {line.strip()}")
-                break
+    fg = _check_foreground(device)
+    if fg and PKG in fg:
+        print(f"  App launched (via monkey)")
+        return True
 
     print(f"  App launched (foreground not confirmed)")
     return True
+
+
+def _check_foreground(device):
+    """Return the mFocusedApp line, or empty string."""
+    # Use shell pipe to grep on-device (avoids pulling megabytes of dumpsys)
+    rc, out = adb(["shell", "dumpsys activity activities | grep mFocusedApp"], device, timeout=10)
+    return out.strip() if rc == 0 else ""
 
 
 def _ensure_foreground(device):
@@ -319,21 +319,18 @@ def _ensure_foreground(device):
         adb(["shell", "input", "swipe", "540", "1800", "540", "800"], device)
         time.sleep(1)
 
-    rc, dumpsys = adb(["shell", "dumpsys", "activity", "activities"], device, timeout=15)
-    if rc != 0 or not dumpsys:
+    fg = _check_foreground(device)
+    if not fg:
         return
-    for line in dumpsys.splitlines():
-        if "mResumedActivity" in line:
-            if PKG in line:
-                return  # All good
-            # App lost foreground - relaunch
-            print(f"\n  App lost foreground ({line.strip()}), relaunching...")
-            adb(["shell", "input", "keyevent", "KEYCODE_APP_SWITCH"], device)
-            time.sleep(1)
-            adb(["shell", "am", "start", "-W", "-S", "--activity-clear-top",
-                 "--activity-clear-task", "-n", ACTIVITY], device)
-            time.sleep(2)
-            return
+    if PKG in fg:
+        return  # All good
+    # App lost foreground - relaunch
+    print(f"\n  App lost foreground ({fg}), relaunching...")
+    adb(["shell", "input", "keyevent", "KEYCODE_APP_SWITCH"], device)
+    time.sleep(1)
+    adb(["shell", "am", "start", "-W", "-S", "--activity-clear-top",
+         "--activity-clear-task", "-n", ACTIVITY], device)
+    time.sleep(2)
 
 
 def step_poll_and_pull(device, timeout=POLL_TIMEOUT):
@@ -412,6 +409,83 @@ def parse_results(xml_path):
             "duration": duration, "failures": failures}
 
 
+# ── QA Reports Upload ─────────────────────────────────────────────────────
+def _api_post(path, payload=None):
+    """POST JSON to qa-reports API. Returns (status_code, response_dict)."""
+    url = f"{QA_REPORTS_BASE}{path}"
+    data = json.dumps(payload).encode() if payload else None
+    req = urllib.request.Request(
+        url, data=data, headers={"Content-Type": "application/json"}, method="POST"
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            body = json.loads(resp.read().decode())
+            return resp.status, body
+    except urllib.error.HTTPError as e:
+        body = e.read().decode() if e.fp else ""
+        print(f"  API error: HTTP {e.code} {body[:200]}")
+        return e.code, {}
+    except Exception as e:
+        print(f"  API error: {e}")
+        return 0, {}
+
+
+def upload_to_qa_reports(device_model, categories, all_results, is_scheduled):
+    """Upload results to qa-reports.vercel.app using 3-step flow."""
+    print(f"\n{'='*60}")
+    print("UPLOADING TO QA REPORTS")
+    print(f"{'='*60}")
+
+    # Step 1: Create suite
+    suite_payload = {
+        "name": f"{'Scheduled' if is_scheduled else 'Ad-hoc'} - {', '.join(categories)}",
+        "device_model": device_model,
+        "is_scheduled": is_scheduled,
+    }
+    status, resp = _api_post("/api/test-suite/create", suite_payload)
+    if status != 200 or "suite_id" not in resp:
+        print(f"  Failed to create suite (HTTP {status})")
+        return None
+    suite_id = resp["suite_id"]
+    print(f"  Suite created: {suite_id}")
+
+    # Step 2: Add runs for each category
+    for cat, result in all_results.items():
+        if "error" in result:
+            print(f"  Skipping {cat}: {result['error']}")
+            continue
+
+        failed_details = []
+        for name, msg in result.get("failures", []):
+            failed_details.append({"test_name": name, "error_message": msg})
+
+        run_payload = {
+            "category": cat,
+            "device_model": device_model,
+            "total_tests": result["total"],
+            "passed_tests": result["passed"],
+            "failed_tests": result["failed"],
+            "duration": result["duration"],
+            "is_scheduled": is_scheduled,
+            "failed_test_details": failed_details,
+        }
+        status, _ = _api_post(f"/api/test-suite/{suite_id}/add-run", run_payload)
+        if status == 200:
+            print(f"  Uploaded {cat}: {result['passed']}/{result['total']} passed")
+        else:
+            print(f"  Failed to upload {cat} (HTTP {status})")
+
+    # Step 3: Complete suite
+    status, resp = _api_post(f"/api/test-suite/{suite_id}/complete")
+    if status == 200:
+        link = f"{QA_REPORTS_BASE}/suite-reports/{suite_id}"
+        print(f"  Suite completed: {link}")
+        return link
+    else:
+        print(f"  Failed to complete suite (HTTP {status})")
+        return suite_id
+
+
 # ── Interactive Helpers ─────────────────────────────────────────────────────
 def pick_device(devices):
     """Interactive device picker."""
@@ -458,6 +532,7 @@ def main():
     p.add_argument("--list-devices", action="store_true", help="List connected devices")
     p.add_argument("--list-categories", action="store_true", help="List test categories")
     p.add_argument("--timeout", type=int, default=POLL_TIMEOUT, help="Result poll timeout in seconds")
+    p.add_argument("--scheduled", action="store_true", help="Mark as scheduled run (shows on dashboard)")
     args = p.parse_args()
 
     # List commands
@@ -487,7 +562,9 @@ def main():
         if not device:
             return 1
 
-    device_model = next((m for s, m in devices if s == device), "Unknown")
+    # ADB model uses underscores (SM_X610), API expects hyphens (SM-X610)
+    raw_model = next((m for s, m in devices if s == device), "Unknown")
+    device_model = raw_model.replace(" ", "-")
 
     # Category selection
     categories = args.category or (None if not args.deploy_only else ["Sanity"])
@@ -556,6 +633,10 @@ def main():
             else:
                 print(f"  {cat}: {r['passed']}/{r['total']} passed")
         print(f"{'='*60}")
+
+    # Upload to QA Reports
+    if all_results:
+        upload_to_qa_reports(device_model, categories, all_results, args.scheduled)
 
     # Exit code: 0 if all categories had zero failures
     has_failures = any(

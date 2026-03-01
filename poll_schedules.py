@@ -173,7 +173,7 @@ def run_schedule(schedule, device_serials, log):
             continue
 
         # Build command
-        cmd = [sys.executable, str(RUN_PY), "--device", serial, "--yes"]
+        cmd = [sys.executable, str(RUN_PY), "--device", serial, "--yes", "--scheduled"]
         for cat in categories:
             cmd.extend(["-c", cat])
 
