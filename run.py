@@ -226,25 +226,121 @@ def step_permissions(device):
         if rc == 0:
             print(f"  {loc_op} appops: ok")
 
+    # WRITE_SETTINGS via appops (prevents "Change system settings" dialog)
+    rc, _ = adb(["shell", "appops", "set", PKG, "WRITE_SETTINGS", "allow"], device)
+    if rc == 0:
+        print(f"  WRITE_SETTINGS appops: ok")
+
 
 def step_launch(device):
-    """Step 6: Launch test app."""
+    """Step 6: Launch test app with foreground verification."""
     print(f"\n[6/7] Launching tests...")
+
+    # Step 0: Wake screen and keep it on (Unity tests don't run when screen is off)
+    adb(["shell", "input", "keyevent", "KEYCODE_WAKEUP"], device)
+    adb(["shell", "settings", "put", "global", "stay_on_while_plugged_in", "3"], device)
+    # Exempt from doze/battery optimization (prevents Samsung Frecess from freezing)
+    adb(["shell", "cmd", "deviceidle", "whitelist", f"+{PKG}"], device)
+    # Dismiss any lock screen with swipe up
+    adb(["shell", "input", "swipe", "540", "1800", "540", "800"], device)
+    time.sleep(1)
+    print(f"  Screen woken up, stay-on-USB enabled")
+
+    # Step A: Press Recent Apps to escape any hung app (critical for enterprise devices)
+    adb(["shell", "input", "keyevent", "KEYCODE_APP_SWITCH"], device)
+    print(f"  Pressed Recent Apps to clear foreground")
+    time.sleep(1)
+
+    # Step B: Force-stop any existing instance
+    adb(["shell", "am", "force-stop", PKG], device)
+
+    # Step C: Launch with robust flags
     rc, out = adb(
-        ["shell", "am", "start", "-W", "-S", "--activity-clear-top", "-n", ACTIVITY],
+        ["shell", "am", "start", "-W", "-S", "--activity-clear-top",
+         "--activity-clear-task", "-n", ACTIVITY],
         device,
     )
     if rc != 0 or "Error" in out:
         print(f"  ERROR: Launch failed: {out}")
         return False
-    print(f"  App launched")
+
+    # Step D: Verify app is actually in foreground
+    time.sleep(3)
+    for attempt in range(3):
+        rc, dumpsys = adb(["shell", "dumpsys", "activity", "activities"], device, timeout=15)
+        if rc == 0 and dumpsys:
+            for line in dumpsys.splitlines():
+                if "mResumedActivity" in line:
+                    if PKG in line:
+                        print(f"  App launched and in foreground")
+                        return True
+                    else:
+                        print(f"  WARNING: Other app in foreground: {line.strip()}")
+                    break
+
+        if attempt < 2:
+            # Retry: press Recent Apps then relaunch
+            print(f"  Retrying launch (attempt {attempt + 2}/3)...")
+            adb(["shell", "input", "keyevent", "KEYCODE_APP_SWITCH"], device)
+            time.sleep(1)
+            adb(["shell", "am", "start", "-W", "-S", "--activity-clear-top",
+                 "--activity-clear-task", "-n", ACTIVITY], device)
+            time.sleep(3)
+
+    # Fallback: try monkey launcher
+    print(f"  Trying monkey launch as fallback...")
+    adb(["shell", "monkey", "-p", PKG, "-c",
+         "android.intent.category.LAUNCHER", "1"], device)
+    time.sleep(2)
+
+    # Final foreground check
+    rc, dumpsys = adb(["shell", "dumpsys", "activity", "activities"], device, timeout=15)
+    if rc == 0 and dumpsys:
+        for line in dumpsys.splitlines():
+            if "mResumedActivity" in line:
+                if PKG in line:
+                    print(f"  App launched (via monkey)")
+                    return True
+                else:
+                    print(f"  WARNING: App may not be in foreground: {line.strip()}")
+                break
+
+    print(f"  App launched (foreground not confirmed)")
     return True
+
+
+def _ensure_foreground(device):
+    """Check if test app is in foreground; wake screen and relaunch if needed."""
+    # Check if screen is awake first
+    rc, power = adb(["shell", "dumpsys", "power"], device, timeout=10)
+    if rc == 0 and "mWakefulness=Dozing" in power:
+        print(f"\n  Screen is off, waking up...")
+        adb(["shell", "input", "keyevent", "KEYCODE_WAKEUP"], device)
+        adb(["shell", "input", "swipe", "540", "1800", "540", "800"], device)
+        time.sleep(1)
+
+    rc, dumpsys = adb(["shell", "dumpsys", "activity", "activities"], device, timeout=15)
+    if rc != 0 or not dumpsys:
+        return
+    for line in dumpsys.splitlines():
+        if "mResumedActivity" in line:
+            if PKG in line:
+                return  # All good
+            # App lost foreground - relaunch
+            print(f"\n  App lost foreground ({line.strip()}), relaunching...")
+            adb(["shell", "input", "keyevent", "KEYCODE_APP_SWITCH"], device)
+            time.sleep(1)
+            adb(["shell", "am", "start", "-W", "-S", "--activity-clear-top",
+                 "--activity-clear-task", "-n", ACTIVITY], device)
+            time.sleep(2)
+            return
 
 
 def step_poll_and_pull(device, timeout=POLL_TIMEOUT):
     """Step 7: Poll for results, pull XML when ready."""
     print(f"\n[7/7] Waiting for test results...")
     start = time.time()
+    last_fg_check = start
 
     while time.time() - start < timeout:
         rc, out = adb(["shell", "ls", f"{DEVICE_RESULTS}/"], device)
@@ -261,6 +357,12 @@ def step_poll_and_pull(device, timeout=POLL_TIMEOUT):
 
                 # Return first XML file path
                 return local_dir / xml_files[0]
+
+        # Periodic foreground check every 2 minutes
+        now = time.time()
+        if now - last_fg_check >= 120:
+            _ensure_foreground(device)
+            last_fg_check = now
 
         elapsed = int(time.time() - start)
         mins, secs = divmod(elapsed, 60)
